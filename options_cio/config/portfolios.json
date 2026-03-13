@@ -1,0 +1,94 @@
+{
+  "portfolios": {
+    "P1": {
+      "name": "Crypto Convexity",
+      "role": "Upside acceleration + crash convexity",
+      "strategy": "Long-dated deep ITM LEAPS on BTC/ETH proxies",
+      "capital": 125000,
+      "deployment_band": [0.30, 0.50],
+      "target_zone": [0.40, 0.45],
+      "allowed_instruments": ["IBIT", "ETHA", "BTC options", "ETH options"],
+      "excluded": ["altcoins", "leveraged crypto ETFs", "short-dated options"],
+      "allowed_structures": ["long_leaps"],
+      "hedge_budget_pct": 0.04,
+      "prohibitions": ["naked_short", "call_overwriting", "hedge_removal_for_yield", "income_selling"],
+      "leap_rules": {
+        "tenor_months_min": 24,
+        "tenor_months_max": 36,
+        "delta_min": 0.75,
+        "delta_max": 0.85,
+        "roll_review_months": 18,
+        "roll_mandatory_months": 12,
+        "roll_delta_threshold": 0.90
+      },
+      "hedge_layers": [
+        { "drawdown_range": "20-40%", "instrument": "near-term put backspreads", "cost": "zero or low" },
+        { "drawdown_range": "40-80%", "instrument": "6-12 month deep OTM puts laddered", "cost": "from hedge budget" }
+      ],
+      "min_hedge_coverage": 0.70,
+      "mandate": "Convex upside portfolio. Income generation explicitly prohibited. Survivability through severe crypto drawdowns mandatory."
+    },
+    "P2": {
+      "name": "Hedged Index Income",
+      "role": "Core return engine",
+      "strategy": "Income BWBs on SPX/ES with structural hedge",
+      "capital": 125000,
+      "deployment_band": [0.50, 0.65],
+      "target_zone": [0.55, 0.60],
+      "allowed_instruments": ["SPX", "ES"],
+      "allowed_structures": ["income_bwb"],
+      "max_concurrent_expiry_buckets": 2,
+      "hedge_always_mandatory": true,
+      "min_hedge_coverage": 0.80,
+      "max_design_drawdown": 0.15,
+      "prohibitions": ["naked_short_vol", "hedge_removal"],
+      "mandate": "P2 may never operate naked. Hedge coverage >= 80% of worst-case modeled loss."
+    },
+    "P3": {
+      "name": "Macro Stability",
+      "role": "System stabiliser — drawdown control & optionality",
+      "strategy": "Calendars and diagonals on macro ETFs",
+      "capital": 125000,
+      "deployment_band": [0.0, 0.20],
+      "target_zone": [0.05, 0.10],
+      "max_portfolio_loss_pct": 0.05,
+      "per_trade_risk_pct": 0.005,
+      "position_count": [8, 12],
+      "allowed_structures": {
+        "calendars": { "weight": "60-70%", "long_dte": [60, 90], "short_dte": [20, 30] },
+        "diagonals": { "weight": "30-40%", "long_dte": [90, 120], "short_dte": [30, 45], "short_delta": [20, 25] }
+      },
+      "vega_positive_at_entry": true,
+      "allowed_instruments_rates": ["TLT", "IEF", "ZB", "ZN"],
+      "allowed_instruments_fx": ["UUP", "FXE", "FXY"],
+      "allowed_instruments_commodities": ["GLD", "SLV", "USO"],
+      "allowed_instruments_ex_us": ["EEM", "EWJ", "FXI"],
+      "excluded": ["SPX", "QQQ", "crypto proxies", "leveraged ETFs"],
+      "prohibitions": ["short_volatility", "spx_qqq_exposure", "crypto_proxies"],
+      "max_design_drawdown": 0.10,
+      "mandate": "P3 exists to reduce system-level volatility and drawdowns. Stability and diversification over return maximisation."
+    },
+    "P4": {
+      "name": "Hedged Equity Income",
+      "role": "Return enhancement via volatility selling",
+      "strategy": "Short puts, light strangles, Jade Lizards on large-cap + liquid ETFs",
+      "capital": 125000,
+      "deployment_band": [0.55, 0.70],
+      "target_zone": [0.60, 0.65],
+      "income_engine": { "dte": [35, 45], "delta": [20, 30], "effective_exposure": [0.60, 0.70] },
+      "allowed_instruments": ["AAPL", "MSFT", "NVDA", "QQQ", "IWM", "SMH"],
+      "hedge_instruments": ["SPX", "VIX"],
+      "excluded": ["small_caps", "illiquid_equities", "meme_stocks"],
+      "hedge_layers": {
+        "spx_structural": "Long-dated SPX put vertical — not traded tactically",
+        "vix_convex": "Near-term VIX call spreads — monetized during vol spikes"
+      },
+      "vix_hedge_coverage_min": 0.30,
+      "vix_hedge_coverage_max": 0.40,
+      "min_hedge_coverage": 0.70,
+      "max_design_drawdown": 0.15,
+      "prohibitions": ["unhedged_short_vol", "hedge_removal_for_yield", "concentration_increase_under_stress"],
+      "mandate": "P4 sells volatility but rents convexity. Income generation must never compromise survivability."
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "rules": [
+    { "id": "max_risk_per_trade", "type": "portfolio", "metric": "position_risk_pct", "threshold": 0.02, "severity": "CRITICAL" },
+    { "id": "max_portfolio_delta", "type": "portfolio", "metric": "total_delta", "threshold": 0.50, "severity": "WARN" },
+    { "id": "close_at_50_profit", "type": "position", "metric": "profit_pct_of_max", "threshold": 0.50, "severity": "CRITICAL" },
+    { "id": "stop_loss_200pct_premium", "type": "position", "metric": "loss_pct_of_credit", "threshold": 2.00, "severity": "CRITICAL" },
+    { "id": "no_hold_through_earnings", "type": "position", "metric": "earnings_within_dte", "threshold": 5, "severity": "WARN" },
+    { "id": "min_iv_rank_to_enter", "type": "entry", "metric": "iv_rank", "threshold": 30, "severity": "INFO" },
+    { "id": "max_dte_entry", "type": "entry", "metric": "dte_at_entry", "threshold": 60, "severity": "INFO" },
+    { "id": "close_at_21_dte", "type": "position", "metric": "dte_remaining", "threshold": 21, "severity": "WARN" }
+  ],
+  "system_rules": [
+    { "id": "no_income_without_hedge", "description": "No income strategy without structural hedge", "severity": "CRITICAL" },
+    { "id": "no_hedge_removal", "description": "No hedge removal to improve short-term returns", "severity": "CRITICAL" },
+    { "id": "no_deploy_increase_vol_spike", "description": "No deployment increase during volatility spikes", "severity": "CRITICAL" }
+  ]
+}

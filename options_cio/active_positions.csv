@@ -1,0 +1,16 @@
+portfolio,ticker,option_type,strike,expiry,qty,entry_price,structure_tag
+P1,IBIT,call,35.00,2027-01-15,10,8.50,long_leap
+P1,ETHA,call,18.00,2027-01-15,15,4.20,long_leap
+P1,IBIT,put,20.00,2025-06-20,-10,1.10,crash_hedge_put
+P2,SPX,put,5200.00,2025-04-17,-2,18.50,income_bwb_short
+P2,SPX,put,5100.00,2025-04-17,4,9.80,income_bwb_long
+P2,SPX,put,4900.00,2025-06-20,1,35.00,spx_structural_hedge
+P3,TLT,call,92.00,2025-05-16,5,2.30,calendar_long_leg
+P3,TLT,call,92.00,2025-04-17,-5,1.10,calendar_short_leg
+P3,GLD,call,195.00,2025-06-20,3,4.80,diagonal_long_leg
+P3,GLD,call,200.00,2025-04-17,-3,1.60,diagonal_short_leg
+P4,AAPL,put,210.00,2025-04-25,-3,3.40,short_put
+P4,NVDA,put,105.00,2025-04-25,-2,4.10,jade_lizard_put
+P4,NVDA,call,135.00,2025-04-25,-2,1.80,jade_lizard_call
+P4,SPX,put,5000.00,2025-09-19,1,42.00,spx_hedge
+P4,VIX,call,22.00,2025-04-16,5,1.25,vix_hedge
