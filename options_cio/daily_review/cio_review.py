@@ -55,7 +55,7 @@ class CIODailyReview:
         self.pm = PortfolioManager(positions_path, db_path).load()
         self.rules = RulesEngine(rules_path)
         self.greeks = GreeksEngine()
-        self.feed = YFinanceFeed(cache_ttl_seconds=settings.get("refresh_interval_seconds", 60))
+        self.feed = YFinanceFeed()
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
             ai_offline=settings.get("ai_offline", False),
@@ -63,7 +63,7 @@ class CIODailyReview:
             api_key=api_key,
         )
         self.journal = TradeJournal(db_path)
-        self.cache = StateCache(default_ttl=settings.get("refresh_interval_seconds", 60))
+        self.cache = StateCache(db_path)
         self.simulator = WhatIfSimulator()
 
     # ------------------------------------------------------------------
@@ -77,7 +77,12 @@ class CIODailyReview:
 
         # 2. Fetch prices
         price_map = self.feed.get_prices(tickers)
-        iv_map = {t: self.feed.get_historical_volatility(t) or 0.30 for t in tickers}
+        iv_map = {}
+        for t in tickers:
+            try:
+                iv_map[t] = self.feed.get_iv_rank(t) / 100.0
+            except ValueError:
+                iv_map[t] = 0.30
         market_snapshot = self.feed.get_market_snapshot()
         vix = float(market_snapshot.get("vix") or 20.0)
 

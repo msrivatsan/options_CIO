@@ -105,7 +105,7 @@ class OptionsCIODashboard(App):
         self.pm = PortfolioManager(positions_path, settings.get("db_path", "./options_cio.db")).load()
         self.rules = RulesEngine(config_dir / "trading_rules.json")
         self.greeks_engine = GreeksEngine()
-        self.feed = YFinanceFeed(cache_ttl_seconds=settings.get("refresh_interval_seconds", 60))
+        self.feed = YFinanceFeed()
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
             ai_offline=settings.get("ai_offline", False),
@@ -114,7 +114,7 @@ class OptionsCIODashboard(App):
         )
         self.journal = TradeJournal(settings.get("db_path", "./options_cio.db"))
         self.simulator = WhatIfSimulator()
-        self.cache = StateCache()
+        self.cache = StateCache(settings.get("db_path", "./options_cio.db"))
 
         # State
         self._price_map: dict[str, float] = {}
@@ -199,7 +199,12 @@ class OptionsCIODashboard(App):
             self._price_map = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.feed.get_prices(tickers)
             )
-            self._iv_map = {t: self.feed.get_historical_volatility(t) or 0.30 for t in tickers}
+            self._iv_map = {}
+            for t in tickers:
+                try:
+                    self._iv_map[t] = self.feed.get_iv_rank(t) / 100.0
+                except ValueError:
+                    self._iv_map[t] = 0.30
             self._market_snapshot = await asyncio.get_event_loop().run_in_executor(
                 None, self.feed.get_market_snapshot
             )
