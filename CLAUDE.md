@@ -130,4 +130,4 @@ Install: `pip install -r requirements.txt --break-system-packages`
 
 | Date | Change | Commit |
 |------|--------|--------|
-| 2026-03-13 | Initial project scaffold — all modules, configs, sample positions | _(pending first push)_ |
+| 2026-03-13 | Initial project scaffold — all modules, configs, sample positions | `c4e6a81` |
