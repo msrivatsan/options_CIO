@@ -66,6 +66,7 @@ options_cio/
 3. No deployment increase during volatility spikes (VIX > 30).
 4. No naked short positions in any portfolio.
 5. P1: income generation is explicitly prohibited.
+6. **SECURITY CRITICAL:** Never commit, push, or expose API keys (ANTHROPIC_API_KEY, credentials, tokens) to GitHub or any public repository. All sensitive keys must stay in environment variables or `.env` files (add to `.gitignore` immediately if not already present). If a key is accidentally exposed, revoke it immediately and rotate.
 
 ---
 
