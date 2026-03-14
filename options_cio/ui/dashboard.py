@@ -22,7 +22,7 @@ from textual.timer import Timer
 
 from options_cio.core.greeks_engine import GreeksEngine
 from options_cio.core.portfolio_manager import PortfolioManager
-from options_cio.core.rules_engine import RulesEngine
+from options_cio.core.rules_engine import RulesEngine, INCOME_ROLES, HEDGE_ROLES
 from options_cio.core.state_cache import StateCache
 from options_cio.ai.cio_brain import CIOBrain
 from options_cio.data.feed_adapter import YFinanceFeed
@@ -36,6 +36,19 @@ BASE_DIR = Path(__file__).parent.parent
 
 _ZERO_SUMMARY = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0,
                  "position_count": 0, "pending_count": 0, "stale_count": 0}
+
+
+class _NullAdapter:
+    """Stub adapter for CSV-fallback mode — RulesEngine requires an adapter."""
+    def get_accounts(self) -> dict:
+        return {}
+    def get_positions(self, portfolio_id: str) -> list[dict]:
+        return []
+    def get_balances(self, portfolio_id: str) -> dict:
+        return {"net_liquidating_value": 0, "option_buying_power": 0,
+                "deployment_pct": 0, "committed_obp": 0}
+    def get_market_metrics(self, symbols: list[str]) -> dict:
+        return {}
 
 
 class OptionsCIODashboard(App):
@@ -109,7 +122,8 @@ class OptionsCIODashboard(App):
 
         positions_path = BASE_DIR / "active_positions.csv"
         self.pm = PortfolioManager(positions_path, settings.get("db_path", "./options_cio.db")).load()
-        self.rules = RulesEngine(config_dir / "trading_rules.json")
+        self._rules_path = config_dir / "trading_rules.json"
+        self.rules = None  # initialized after adapter is ready
         self.feed = YFinanceFeed()  # always used for market snapshot
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
@@ -271,44 +285,89 @@ class OptionsCIODashboard(App):
     async def _refresh_data(self) -> None:
         self.notify("Refreshing market data...", severity="information")
         try:
-            all_positions = self.pm.get_all_positions()
-
             self._market_snapshot = await asyncio.get_event_loop().run_in_executor(
                 None, self.feed.get_market_snapshot
             )
             vix = float(self._market_snapshot.get("vix") or 20.0)
 
-            self._portfolio_states = self.pm.get_all_portfolio_states(
-                {}, self.capital_map, vix
-            )
             self._greeks_summaries = []
             self._alerts = []
 
-            for pid in self.pm.get_portfolio_ids():
-                positions = self.pm.get_positions_for_portfolio(pid)
-
-                if self._greeks_engine is not None:
-                    try:
-                        summary = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda p=pid: self._greeks_engine.summary(p)
-                        )
-                    except Exception as e:
-                        logger.warning("Greeks failed for %s: %s", pid, e)
-                        summary = {**_ZERO_SUMMARY, "portfolio": pid}
-                else:
-                    summary = {**_ZERO_SUMMARY, "portfolio": pid}
-
-                self._greeks_summaries.append(summary)
-
-                alerts = self.rules.evaluate_portfolio(
-                    portfolio_id=pid, positions=positions,
-                    greeks_summary=summary,
-                    capital=self.capital_map.get(pid, 125000),
+            if self._adapter is not None:
+                # Live tastytrade evaluation via evaluate_all()
+                rules = RulesEngine(
+                    self._rules_path, self.portfolios_config,
+                    self._adapter, self._greeks_engine,
                 )
-                self._alerts.extend(str(a) for a in alerts)
+                self.rules = rules
 
-            system_alerts = self.rules.evaluate_system(self._portfolio_states)
-            self._alerts.extend(str(a) for a in system_alerts)
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, rules.evaluate_all
+                )
+                self._alerts.extend(str(a) for a in result.alerts)
+
+                # Build portfolio states from live balances
+                self._portfolio_states = []
+                accounts = self._adapter.get_accounts()
+                for pid in accounts:
+                    balances = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda p=pid: self._adapter.get_balances(p)
+                    )
+                    positions = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda p=pid: self._adapter.get_positions(p)
+                    )
+                    cfg = self.portfolios_config["portfolios"].get(pid, {})
+                    income_count = sum(1 for p in positions if p.get("role") in INCOME_ROLES)
+                    hedge_count = sum(1 for p in positions if p.get("role") in HEDGE_ROLES)
+
+                    self._portfolio_states.append({
+                        "portfolio_id": pid,
+                        "deployment_pct": balances["deployment_pct"] / 100.0,
+                        "deployed_capital": balances["committed_obp"],
+                        "capital": balances["net_liquidating_value"],
+                        "has_income_positions": income_count > 0,
+                        "has_hedge": hedge_count > 0,
+                        "position_count": len(positions),
+                        "vix": vix,
+                    })
+
+                    if self._greeks_engine is not None:
+                        try:
+                            summary = await asyncio.get_event_loop().run_in_executor(
+                                None, lambda p=pid: self._greeks_engine.summary(p)
+                            )
+                        except Exception as e:
+                            logger.warning("Greeks failed for %s: %s", pid, e)
+                            summary = {**_ZERO_SUMMARY, "portfolio": pid}
+                    else:
+                        summary = {**_ZERO_SUMMARY, "portfolio": pid}
+                    self._greeks_summaries.append(summary)
+            else:
+                # CSV fallback (yfinance / offline mode)
+                self._portfolio_states = self.pm.get_all_portfolio_states(
+                    {}, self.capital_map, vix
+                )
+                # Lazy-init rules for CSV mode
+                if self.rules is None:
+                    self.rules = RulesEngine(
+                        self._rules_path, self.portfolios_config,
+                        adapter=_NullAdapter(), greeks_engine=None,
+                    )
+
+                for pid in self.pm.get_portfolio_ids():
+                    positions = self.pm.get_positions_for_portfolio(pid)
+                    summary = {**_ZERO_SUMMARY, "portfolio": pid}
+                    self._greeks_summaries.append(summary)
+
+                    alerts = self.rules.evaluate_portfolio(
+                        portfolio_id=pid, positions=positions,
+                        greeks_summary=summary,
+                        capital=self.capital_map.get(pid, 125000),
+                    )
+                    self._alerts.extend(str(a) for a in alerts)
+
+                system_alerts = self.rules.evaluate_system(self._portfolio_states)
+                self._alerts.extend(str(a) for a in system_alerts)
 
             self._update_ui()
             self.notify("Refresh complete.", severity="information")

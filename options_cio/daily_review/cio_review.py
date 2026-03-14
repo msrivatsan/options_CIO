@@ -73,7 +73,8 @@ class CIODailyReview:
         }
 
         self.pm = PortfolioManager(positions_path, db_path).load()
-        self.rules = RulesEngine(rules_path)
+        self._rules_path = rules_path
+        self._adapter = None
         self.feed = YFinanceFeed()  # always used for market snapshot (VIX, SPX)
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
@@ -93,56 +94,67 @@ class CIODailyReview:
         market_snapshot = self.feed.get_market_snapshot()
         vix = float(market_snapshot.get("vix") or 20.0)
 
-        portfolio_states = self.pm.get_all_portfolio_states(
-            {}, self.capital_map, vix
-        )
-
         greeks_summaries: list[dict] = []
         all_alerts: list[str] = []
 
         if self._data_source == "tastytrade":
-            greeks_engine = self._build_live_greeks_engine()
-        else:
-            greeks_engine = None
-
-        for pid in self.pm.get_portfolio_ids():
-            positions = self.pm.get_positions_for_portfolio(pid)
-
-            if greeks_engine is not None:
-                try:
-                    summary = greeks_engine.summary(pid)
-                except Exception as e:
-                    logger.warning("Greeks fetch failed for %s: %s", pid, e)
-                    summary = _zero_greeks_summary(pid)
-            else:
-                summary = _zero_greeks_summary(pid)
-
-            greeks_summaries.append(summary)
-
-            alerts = self.rules.evaluate_portfolio(
-                portfolio_id=pid,
-                positions=positions,
-                greeks_summary=summary,
-                capital=self.capital_map.get(pid, 125000),
-            )
-            for alert in alerts:
-                all_alerts.append(str(alert))
-                self.journal.log_alert(
-                    rule_id=alert.rule_id,
-                    severity=alert.severity.value,
-                    message=alert.message,
-                    portfolio=alert.portfolio,
-                    ticker=alert.ticker,
-                    value=alert.value,
-                    threshold=alert.threshold,
+            # Full live evaluation via tastytrade adapter
+            adapter, greeks_engine = self._build_live_greeks_engine()
+            if adapter is not None:
+                self._adapter = adapter
+                rules = RulesEngine(
+                    self._rules_path, self.portfolios_config,
+                    adapter, greeks_engine,
                 )
+                result = rules.evaluate_all()
 
-        system_alerts = self.rules.evaluate_system(portfolio_states)
-        for alert in system_alerts:
-            all_alerts.append(str(alert))
+                for alert in result.alerts:
+                    all_alerts.append(str(alert))
+                    self.journal.log_alert(
+                        rule_id=alert.rule_id,
+                        severity=alert.severity.value,
+                        message=alert.message,
+                        portfolio=alert.portfolio,
+                        ticker=alert.ticker,
+                        value=alert.value,
+                        threshold=alert.threshold,
+                    )
 
-        all_positions = self.pm.get_all_positions()
-        positions_summary = self._format_positions_summary(all_positions)
+                # Collect greeks summaries from live engine
+                if greeks_engine is not None:
+                    for pid in adapter.get_accounts():
+                        try:
+                            greeks_summaries.append(greeks_engine.summary(pid))
+                        except Exception as e:
+                            logger.warning("Greeks summary failed for %s: %s", pid, e)
+                            greeks_summaries.append(_zero_greeks_summary(pid))
+
+                # Format positions from live adapter
+                positions_lines = []
+                for pid in adapter.get_accounts():
+                    for pos in adapter.get_positions(pid):
+                        positions_lines.append(
+                            f"{pid} | {pos.get('underlying_symbol', '')} "
+                            f"{pos.get('option_type', pos.get('instrument_type', ''))} "
+                            f"{pos.get('strike_price', '')} "
+                            f"exp:{pos.get('expiration_date', '')} "
+                            f"qty:{pos.get('quantity', '')} "
+                            f"@ ${pos.get('average_open_price', '')} "
+                            f"[{pos.get('role', '')}] "
+                            f"DTE:{pos.get('dte', '?')}"
+                        )
+                positions_summary = "\n".join(positions_lines)
+
+                portfolio_states = []  # already evaluated in evaluate_all
+            else:
+                # Tastytrade init failed — fall back to CSV
+                return self._run_csv_fallback(market_snapshot, vix)
+        else:
+            return self._run_csv_fallback(market_snapshot, vix)
+
+        if not greeks_summaries:
+            for pid in self.pm.get_portfolio_ids():
+                greeks_summaries.append(_zero_greeks_summary(pid))
 
         ai_output = self.brain.daily_review(
             portfolio_states=portfolio_states,
@@ -165,14 +177,13 @@ class CIODailyReview:
     # Live Greeks via tastytrade
     # ------------------------------------------------------------------
 
-    def _build_live_greeks_engine(self) -> GreeksEngine | None:
+    def _build_live_greeks_engine(self) -> tuple[object | None, GreeksEngine | None]:
         """
         Create a TastytradeAdapter, collect live Greeks for all option
-        positions for _STREAM_COLLECT_SECONDS, then return a GreeksEngine
-        backed by the populated streamer snapshot.
+        positions for _STREAM_COLLECT_SECONDS, then return the adapter
+        and a GreeksEngine backed by the populated streamer snapshot.
 
-        The streamer context exits after collection but live_data remains
-        readable — sufficient for a one-shot daily review.
+        Returns (adapter, greeks_engine) or (None, None) on failure.
         """
         try:
             from options_cio.data.tastytrade_adapter import TastytradeAdapter
@@ -193,7 +204,7 @@ class CIODailyReview:
 
             if not symbols:
                 logger.warning("No option positions found — skipping live Greeks")
-                return None
+                return adapter, None
 
             logger.info("Collecting live Greeks for %d symbols (%ds)...",
                         len(symbols), _STREAM_COLLECT_SECONDS)
@@ -209,11 +220,86 @@ class CIODailyReview:
             received = sum(1 for s in symbols if streamer.get_greeks(s) is not None)
             logger.info("Greeks received for %d/%d symbols", received, len(symbols))
 
-            return GreeksEngine(adapter, streamer)
+            return adapter, GreeksEngine(adapter, streamer)
 
         except Exception as e:
             logger.error("Could not build live Greeks engine: %s", e)
-            return None
+            return None, None
+
+    # ------------------------------------------------------------------
+    # CSV fallback (yfinance / offline mode)
+    # ------------------------------------------------------------------
+
+    def _run_csv_fallback(self, market_snapshot: dict, vix: float) -> str:
+        """Run rules evaluation using CSV positions (non-tastytrade mode)."""
+        portfolio_states = self.pm.get_all_portfolio_states(
+            {}, self.capital_map, vix
+        )
+
+        greeks_summaries: list[dict] = []
+        all_alerts: list[str] = []
+
+        # In CSV fallback, create a minimal RulesEngine without adapter
+        # and use the old evaluate_portfolio path
+        from options_cio.core.rules_engine import RulesEngine as _RE
+        rules = _RE.__new__(_RE)
+        import json as _json
+        with open(self._rules_path) as f:
+            data = _json.load(f)
+        rules.rules = data.get("rules", [])
+        rules.system_rules = data.get("system_rules", [])
+        rules.portfolios_config = self.portfolios_config.get("portfolios", self.portfolios_config)
+        rules.adapter = None
+        rules.greeks_engine = None
+        rules._system_state = "GREEN"
+        rules._violation_log = []
+
+        for pid in self.pm.get_portfolio_ids():
+            positions = self.pm.get_positions_for_portfolio(pid)
+            summary = _zero_greeks_summary(pid)
+            greeks_summaries.append(summary)
+
+            alerts = rules.evaluate_portfolio(
+                portfolio_id=pid,
+                positions=positions,
+                greeks_summary=summary,
+                capital=self.capital_map.get(pid, 125000),
+            )
+            for alert in alerts:
+                all_alerts.append(str(alert))
+                self.journal.log_alert(
+                    rule_id=alert.rule_id,
+                    severity=alert.severity.value,
+                    message=alert.message,
+                    portfolio=alert.portfolio,
+                    ticker=alert.ticker,
+                    value=alert.value,
+                    threshold=alert.threshold,
+                )
+
+        system_alerts = rules.evaluate_system(portfolio_states)
+        for alert in system_alerts:
+            all_alerts.append(str(alert))
+
+        all_positions = self.pm.get_all_positions()
+        positions_summary = self._format_positions_summary(all_positions)
+
+        ai_output = self.brain.daily_review(
+            portfolio_states=portfolio_states,
+            greeks_summaries=greeks_summaries,
+            rule_alerts=all_alerts,
+            market_snapshot=market_snapshot,
+            positions_summary=positions_summary,
+        )
+
+        self.journal.log_ai_review(
+            review_type="daily",
+            ai_output=ai_output,
+            input_summary=f"VIX={vix} | alerts={len(all_alerts)}",
+            cost_usd=self.brain.get_daily_cost(),
+        )
+
+        return self._format_output(market_snapshot, greeks_summaries, all_alerts, ai_output)
 
     # ------------------------------------------------------------------
     # Formatting
