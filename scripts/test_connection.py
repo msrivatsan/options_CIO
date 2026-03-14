@@ -14,6 +14,11 @@ Requires:
 import asyncio
 import os
 import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Ensure project root is on the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -136,7 +141,7 @@ def main():
         test_symbol = all_option_symbols[0]
         print(f"  Streaming Greeks for {test_symbol} (5 seconds)...")
         try:
-            asyncio.run(_stream_test(adapter.session, test_symbol))
+            adapter._event_loop.run_until_complete(_stream_test(adapter.session, test_symbol))
         except Exception as e:
             print(f"  ✗ Streaming failed: {e}")
 
