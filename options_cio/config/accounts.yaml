@@ -1,0 +1,13 @@
+accounts:
+  - account_number: "REPLACE_WITH_P1_ACCOUNT"
+    portfolio: P1
+    name: "Crypto Convexity"
+  - account_number: "REPLACE_WITH_P2_ACCOUNT"
+    portfolio: P2
+    name: "Hedged Index Income"
+  - account_number: "REPLACE_WITH_P3_ACCOUNT"
+    portfolio: P3
+    name: "Macro Stability"
+  - account_number: "REPLACE_WITH_P4_ACCOUNT"
+    portfolio: P4
+    name: "Hedged Equity Income"

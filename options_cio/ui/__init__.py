@@ -1,3 +1,3 @@
-from .dashboard import Dashboard
+from .dashboard import OptionsCIODashboard
 
-__all__ = ["Dashboard"]
+__all__ = ["OptionsCIODashboard"]

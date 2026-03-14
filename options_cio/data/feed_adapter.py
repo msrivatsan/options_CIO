@@ -300,10 +300,16 @@ class YFinanceFeed(DataFeedAdapter):
 
 def get_feed(source: str = "yfinance") -> DataFeedAdapter:
     """Return a DataFeedAdapter for the given source name."""
+    if source == "tastytrade":
+        from options_cio.data.tastytrade_adapter import TastytradeAdapter
+
+        return TastytradeAdapter()
     if source == "yfinance":
         return YFinanceFeed()
     if source == "ibkr":
         from options_cio.data.ibkr_adapter import IBKRFeed
 
         return IBKRFeed()
-    raise ValueError(f"Unknown data source: {source!r}. Use 'yfinance' or 'ibkr'.")
+    raise ValueError(
+        f"Unknown data source: {source!r}. Use 'tastytrade', 'yfinance', or 'ibkr'."
+    )
