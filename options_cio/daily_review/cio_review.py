@@ -67,14 +67,9 @@ class CIODailyReview:
         with open(portfolios_config_path) as f:
             self.portfolios_config = json.load(f)
 
-        self.capital_map = {
-            pid: cfg["capital"]
-            for pid, cfg in self.portfolios_config["portfolios"].items()
-        }
-
-        self.pm = PortfolioManager(positions_path, db_path).load()
         self._rules_path = rules_path
         self._adapter = None
+        self.pm = None  # initialized after adapter or in fallback mode
         self.feed = YFinanceFeed()  # always used for market snapshot (VIX, SPX)
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
@@ -102,6 +97,18 @@ class CIODailyReview:
             adapter, greeks_engine = self._build_live_greeks_engine()
             if adapter is not None:
                 self._adapter = adapter
+                self.pm = PortfolioManager(
+                    self.portfolios_config, adapter, self.cache,
+                )
+
+                # Check account connectivity
+                connectivity = self.pm.check_account_connectivity()
+                if not connectivity["all_connected"]:
+                    logger.warning(
+                        "Account connectivity issues: %s",
+                        connectivity["disconnected"],
+                    )
+
                 rules = RulesEngine(
                     self._rules_path, self.portfolios_config,
                     adapter, greeks_engine,
@@ -120,6 +127,9 @@ class CIODailyReview:
                         threshold=alert.threshold,
                     )
 
+                # Portfolio states from live PM
+                portfolio_states = self.pm.get_all_portfolio_states(vix=vix)
+
                 # Collect greeks summaries from live engine
                 if greeks_engine is not None:
                     for pid in adapter.get_accounts():
@@ -129,10 +139,10 @@ class CIODailyReview:
                             logger.warning("Greeks summary failed for %s: %s", pid, e)
                             greeks_summaries.append(_zero_greeks_summary(pid))
 
-                # Format positions from live adapter
+                # Format positions from live PM
                 positions_lines = []
-                for pid in adapter.get_accounts():
-                    for pos in adapter.get_positions(pid):
+                for pid in self.pm.get_portfolio_ids():
+                    for pos in self.pm.get_positions(pid):
                         positions_lines.append(
                             f"{pid} | {pos.get('underlying_symbol', '')} "
                             f"{pos.get('option_type', pos.get('instrument_type', ''))} "
@@ -144,8 +154,6 @@ class CIODailyReview:
                             f"DTE:{pos.get('dte', '?')}"
                         )
                 positions_summary = "\n".join(positions_lines)
-
-                portfolio_states = []  # already evaluated in evaluate_all
             else:
                 # Tastytrade init failed — fall back to CSV
                 return self._run_csv_fallback(market_snapshot, vix)
@@ -232,20 +240,23 @@ class CIODailyReview:
 
     def _run_csv_fallback(self, market_snapshot: dict, vix: float) -> str:
         """Run rules evaluation using CSV positions (non-tastytrade mode)."""
-        portfolio_states = self.pm.get_all_portfolio_states(
-            {}, self.capital_map, vix
-        )
+        from options_cio.core.portfolio_manager import CsvPortfolioManager
+
+        csv_pm = CsvPortfolioManager(self.positions_path)
+        capital_map = {
+            pid: cfg["capital"]
+            for pid, cfg in self.portfolios_config.get("portfolios", {}).items()
+        }
+        portfolio_states = csv_pm.get_all_portfolio_states({}, capital_map, vix)
 
         greeks_summaries: list[dict] = []
         all_alerts: list[str] = []
 
-        # In CSV fallback, create a minimal RulesEngine without adapter
-        # and use the old evaluate_portfolio path
+        # Create a minimal RulesEngine for CSV mode
         from options_cio.core.rules_engine import RulesEngine as _RE
         rules = _RE.__new__(_RE)
-        import json as _json
         with open(self._rules_path) as f:
-            data = _json.load(f)
+            data = json.load(f)
         rules.rules = data.get("rules", [])
         rules.system_rules = data.get("system_rules", [])
         rules.portfolios_config = self.portfolios_config.get("portfolios", self.portfolios_config)
@@ -254,8 +265,8 @@ class CIODailyReview:
         rules._system_state = "GREEN"
         rules._violation_log = []
 
-        for pid in self.pm.get_portfolio_ids():
-            positions = self.pm.get_positions_for_portfolio(pid)
+        for pid in csv_pm.get_portfolio_ids():
+            positions = csv_pm.get_positions_for_portfolio(pid)
             summary = _zero_greeks_summary(pid)
             greeks_summaries.append(summary)
 
@@ -263,7 +274,7 @@ class CIODailyReview:
                 portfolio_id=pid,
                 positions=positions,
                 greeks_summary=summary,
-                capital=self.capital_map.get(pid, 125000),
+                capital=capital_map.get(pid, 125000),
             )
             for alert in alerts:
                 all_alerts.append(str(alert))
@@ -281,7 +292,7 @@ class CIODailyReview:
         for alert in system_alerts:
             all_alerts.append(str(alert))
 
-        all_positions = self.pm.get_all_positions()
+        all_positions = csv_pm.get_all_positions()
         positions_summary = self._format_positions_summary(all_positions)
 
         ai_output = self.brain.daily_review(

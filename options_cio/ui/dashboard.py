@@ -120,9 +120,9 @@ class OptionsCIODashboard(App):
             for pid, cfg in self.portfolios_config["portfolios"].items()
         }
 
-        positions_path = BASE_DIR / "active_positions.csv"
-        self.pm = PortfolioManager(positions_path, settings.get("db_path", "./options_cio.db")).load()
+        self._positions_path = BASE_DIR / "active_positions.csv"
         self._rules_path = config_dir / "trading_rules.json"
+        self.pm = None  # initialized after adapter or in fallback mode
         self.rules = None  # initialized after adapter is ready
         self.feed = YFinanceFeed()  # always used for market snapshot
         self.brain = CIOBrain(
@@ -144,6 +144,9 @@ class OptionsCIODashboard(App):
             try:
                 from options_cio.data.tastytrade_adapter import TastytradeAdapter
                 self._adapter = TastytradeAdapter()
+                self.pm = PortfolioManager(
+                    self.portfolios_config, self._adapter, self.cache,
+                )
             except Exception as e:
                 logger.error("Could not create TastytradeAdapter: %s", e)
                 self.notify(f"Tastytrade init failed: {e}", severity="error")
@@ -293,7 +296,7 @@ class OptionsCIODashboard(App):
             self._greeks_summaries = []
             self._alerts = []
 
-            if self._adapter is not None:
+            if self._adapter is not None and self.pm is not None:
                 # Live tastytrade evaluation via evaluate_all()
                 rules = RulesEngine(
                     self._rules_path, self.portfolios_config,
@@ -306,31 +309,13 @@ class OptionsCIODashboard(App):
                 )
                 self._alerts.extend(str(a) for a in result.alerts)
 
-                # Build portfolio states from live balances
-                self._portfolio_states = []
-                accounts = self._adapter.get_accounts()
-                for pid in accounts:
-                    balances = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda p=pid: self._adapter.get_balances(p)
-                    )
-                    positions = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda p=pid: self._adapter.get_positions(p)
-                    )
-                    cfg = self.portfolios_config["portfolios"].get(pid, {})
-                    income_count = sum(1 for p in positions if p.get("role") in INCOME_ROLES)
-                    hedge_count = sum(1 for p in positions if p.get("role") in HEDGE_ROLES)
+                # Portfolio states from live PM
+                self._portfolio_states = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.pm.get_all_portfolio_states(vix=vix)
+                )
 
-                    self._portfolio_states.append({
-                        "portfolio_id": pid,
-                        "deployment_pct": balances["deployment_pct"] / 100.0,
-                        "deployed_capital": balances["committed_obp"],
-                        "capital": balances["net_liquidating_value"],
-                        "has_income_positions": income_count > 0,
-                        "has_hedge": hedge_count > 0,
-                        "position_count": len(positions),
-                        "vix": vix,
-                    })
-
+                # Greeks summaries
+                for pid in self.pm.get_portfolio_ids():
                     if self._greeks_engine is not None:
                         try:
                             summary = await asyncio.get_event_loop().run_in_executor(
@@ -344,7 +329,10 @@ class OptionsCIODashboard(App):
                     self._greeks_summaries.append(summary)
             else:
                 # CSV fallback (yfinance / offline mode)
-                self._portfolio_states = self.pm.get_all_portfolio_states(
+                from options_cio.core.portfolio_manager import CsvPortfolioManager
+                csv_pm = CsvPortfolioManager(self._positions_path)
+
+                self._portfolio_states = csv_pm.get_all_portfolio_states(
                     {}, self.capital_map, vix
                 )
                 # Lazy-init rules for CSV mode
@@ -354,8 +342,8 @@ class OptionsCIODashboard(App):
                         adapter=_NullAdapter(), greeks_engine=None,
                     )
 
-                for pid in self.pm.get_portfolio_ids():
-                    positions = self.pm.get_positions_for_portfolio(pid)
+                for pid in csv_pm.get_portfolio_ids():
+                    positions = csv_pm.get_positions_for_portfolio(pid)
                     summary = {**_ZERO_SUMMARY, "portfolio": pid}
                     self._greeks_summaries.append(summary)
 
@@ -433,14 +421,31 @@ class OptionsCIODashboard(App):
         # Positions table
         pos_table = self.query_one("#positions-table", DataTable)
         pos_table.clear()
-        for p in self.pm.get_all_positions():
-            pos_table.add_row(
-                p.get("portfolio", ""), p.get("ticker", ""),
-                p.get("option_type", ""), str(p.get("strike", "")),
-                str(p.get("expiry", "")), str(p.get("qty", "")),
-                f"${p.get('entry_price', 0):.2f}",
-                p.get("structure_tag", ""), str(p.get("dte", "?")),
-            )
+        if self.pm is not None and self._adapter is not None:
+            # Live tastytrade positions
+            for p in self.pm.get_all_positions():
+                pos_table.add_row(
+                    p.get("portfolio_id", ""),
+                    p.get("underlying_symbol", p.get("symbol", "")),
+                    p.get("option_type", p.get("instrument_type", "")),
+                    str(p.get("strike_price", "")),
+                    str(p.get("expiration_date", "")),
+                    str(p.get("quantity", "")),
+                    f"${p.get('average_open_price', 0):.2f}",
+                    p.get("role", ""), str(p.get("dte", "?")),
+                )
+        else:
+            # CSV fallback
+            from options_cio.core.portfolio_manager import CsvPortfolioManager
+            csv_pm = CsvPortfolioManager(self._positions_path)
+            for p in csv_pm.get_all_positions():
+                pos_table.add_row(
+                    p.get("portfolio", ""), p.get("ticker", ""),
+                    p.get("option_type", ""), str(p.get("strike", "")),
+                    str(p.get("expiry", "")), str(p.get("qty", "")),
+                    f"${p.get('entry_price', 0):.2f}",
+                    p.get("structure_tag", ""), str(p.get("dte", "?")),
+                )
 
         # Journal alerts
         journal_table = self.query_one("#journal-table", DataTable)
@@ -476,12 +481,25 @@ class OptionsCIODashboard(App):
     async def _run_ai_review(self) -> None:
         self.notify("Running AI review...", severity="information")
         try:
-            all_positions = self.pm.get_all_positions()
-            positions_summary = "\n".join(
-                f"{p['portfolio']} {p['ticker']} {p['option_type']} {p['strike']} "
-                f"exp:{p['expiry']} qty:{p['qty']} [{p['structure_tag']}]"
-                for p in all_positions
-            )
+            if self.pm is not None and self._adapter is not None:
+                all_positions = self.pm.get_all_positions()
+                positions_summary = "\n".join(
+                    f"{p.get('portfolio_id', '')} {p.get('underlying_symbol', '')} "
+                    f"{p.get('option_type', p.get('instrument_type', ''))} "
+                    f"{p.get('strike_price', '')} "
+                    f"exp:{p.get('expiration_date', '')} qty:{p.get('quantity', '')} "
+                    f"[{p.get('role', '')}]"
+                    for p in all_positions
+                )
+            else:
+                from options_cio.core.portfolio_manager import CsvPortfolioManager
+                csv_pm = CsvPortfolioManager(self._positions_path)
+                all_positions = csv_pm.get_all_positions()
+                positions_summary = "\n".join(
+                    f"{p['portfolio']} {p['ticker']} {p['option_type']} {p['strike']} "
+                    f"exp:{p['expiry']} qty:{p['qty']} [{p['structure_tag']}]"
+                    for p in all_positions
+                )
             review = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.brain.daily_review(
