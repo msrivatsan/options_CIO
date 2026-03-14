@@ -63,11 +63,12 @@ class TastytradeAdapter(DataFeedAdapter):
     Live tastytrade data feed via the tastyware/tastytrade SDK.
 
     Provides positions, balances, option chains, market metrics, and
-    transaction history. All methods are synchronous (the SDK handles
-    async internally for streaming; REST calls are sync).
+    transaction history. Wraps async SDK methods with sync interfaces.
     """
 
     def __init__(self) -> None:
+        import asyncio
+
         from tastytrade import Session
 
         client_secret = _require_env("TASTYTRADE_CLIENT_SECRET")
@@ -87,6 +88,7 @@ class TastytradeAdapter(DataFeedAdapter):
 
         # Cache Account objects after first fetch
         self._accounts: dict[str, object] | None = None
+        self._event_loop = asyncio.new_event_loop()
 
     # ------------------------------------------------------------------
     # Accounts
@@ -97,12 +99,16 @@ class TastytradeAdapter(DataFeedAdapter):
         Fetch all accounts and return dict mapping portfolio_id -> Account object.
         Validates that all 4 expected account numbers are present.
         """
+        return self._event_loop.run_until_complete(self._get_accounts_async())
+
+    async def _get_accounts_async(self) -> dict:
+        """Async implementation of account fetching."""
         from tastytrade import Account
 
         if self._accounts is not None:
             return self._accounts
 
-        all_accounts = Account.get(self.session)
+        all_accounts = await Account.get(self.session)
         acct_by_number = {a.account_number: a for a in all_accounts}
 
         result = {}
@@ -121,14 +127,20 @@ class TastytradeAdapter(DataFeedAdapter):
         self._accounts = result
         return result
 
-    def _get_account(self, portfolio_id: str):
+    async def _get_account_async(self, portfolio_id: str):
         """Get the Account object for a portfolio, raising if not found."""
-        accounts = self.get_accounts()
+        accounts = await self._get_accounts_async()
         if portfolio_id not in accounts:
             raise ValueError(
                 f"Portfolio {portfolio_id} not mapped to a tastytrade account"
             )
         return accounts[portfolio_id]
+
+    def _get_account(self, portfolio_id: str):
+        """Sync wrapper for _get_account_async."""
+        return self._event_loop.run_until_complete(
+            self._get_account_async(portfolio_id)
+        )
 
     # ------------------------------------------------------------------
     # Positions
@@ -140,8 +152,14 @@ class TastytradeAdapter(DataFeedAdapter):
         symbol, underlying, instrument_type, quantity, direction, prices,
         and option details where applicable.
         """
-        account = self._get_account(portfolio_id)
-        positions = account.get_positions(self.session, include_marks=True)
+        return self._event_loop.run_until_complete(
+            self._get_positions_async(portfolio_id)
+        )
+
+    async def _get_positions_async(self, portfolio_id: str) -> list[dict]:
+        """Async implementation of position fetching."""
+        account = await self._get_account_async(portfolio_id)
+        positions = await account.get_positions(self.session, include_marks=True)
 
         result = []
         for pos in positions:
@@ -177,8 +195,14 @@ class TastytradeAdapter(DataFeedAdapter):
         Fetch account balances for a portfolio. Returns net_liq, OBP,
         cash_balance, deployment metrics.
         """
-        account = self._get_account(portfolio_id)
-        bal = account.get_balances(self.session)
+        return self._event_loop.run_until_complete(
+            self._get_balances_async(portfolio_id)
+        )
+
+    async def _get_balances_async(self, portfolio_id: str) -> dict:
+        """Async implementation of balance fetching."""
+        account = await self._get_account_async(portfolio_id)
+        bal = await account.get_balances(self.session)
 
         net_liq = float(bal.net_liquidating_value)
         obp = float(bal.derivative_buying_power)
@@ -199,14 +223,18 @@ class TastytradeAdapter(DataFeedAdapter):
 
     def get_system_balances(self) -> dict:
         """Aggregate balances across all 4 portfolio accounts."""
-        accounts = self.get_accounts()
+        return self._event_loop.run_until_complete(self._get_system_balances_async())
+
+    async def _get_system_balances_async(self) -> dict:
+        """Async implementation of system balance aggregation."""
+        accounts = await self._get_accounts_async()
         total_net_liq = 0.0
         total_obp = 0.0
         total_cash = 0.0
         portfolio_balances = {}
 
         for pid in accounts:
-            bal = self.get_balances(pid)
+            bal = await self._get_balances_async(pid)
             total_net_liq += bal["net_liquidating_value"]
             total_obp += bal["option_buying_power"]
             total_cash += bal["cash_balance"]
@@ -247,9 +275,15 @@ class TastytradeAdapter(DataFeedAdapter):
         Fetch option chain from tastytrade. Returns list of option dicts
         grouped by expiration date.
         """
+        return self._event_loop.run_until_complete(
+            self._get_option_chain_async(ticker, expiry)
+        )
+
+    async def _get_option_chain_async(self, ticker: str, expiry: str = None) -> list[dict]:
+        """Async implementation of option chain fetching."""
         from tastytrade.instruments import get_option_chain
 
-        chain = get_option_chain(self.session, ticker)
+        chain = await get_option_chain(self.session, ticker)
         result = []
         for exp_date, options in chain.items():
             if expiry and str(exp_date) != expiry:
@@ -310,9 +344,15 @@ class TastytradeAdapter(DataFeedAdapter):
         Fetch market metrics from tastytrade. Returns dict keyed by symbol with
         IV rank, IV percentile, historical volatility, beta, etc.
         """
+        return self._event_loop.run_until_complete(
+            self._get_market_metrics_async(symbols)
+        )
+
+    async def _get_market_metrics_async(self, symbols: list[str]) -> dict:
+        """Async implementation of market metrics fetching."""
         from tastytrade.metrics import get_market_metrics
 
-        metrics = get_market_metrics(self.session, symbols)
+        metrics = await get_market_metrics(self.session, symbols)
         result = {}
         for m in metrics:
             result[m.symbol] = {
@@ -349,14 +389,25 @@ class TastytradeAdapter(DataFeedAdapter):
         Fetch transaction history for a portfolio account.
         Returns list of transaction dicts for journal auto-population.
         """
-        account = self._get_account(portfolio_id)
+        return self._event_loop.run_until_complete(
+            self._get_transactions_async(portfolio_id, start_date, end_date)
+        )
+
+    async def _get_transactions_async(
+        self,
+        portfolio_id: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[dict]:
+        """Async implementation of transaction history fetching."""
+        account = await self._get_account_async(portfolio_id)
         kwargs = {}
         if start_date:
             kwargs["start_date"] = start_date
         if end_date:
             kwargs["end_date"] = end_date
 
-        transactions = account.get_history(self.session, **kwargs)
+        transactions = await account.get_history(self.session, **kwargs)
         result = []
         for txn in transactions:
             result.append({
