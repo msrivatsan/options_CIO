@@ -6,10 +6,10 @@ A systematic options portfolio management system powered by Claude AI. Manages 4
 
 | ID | Name | Strategy | Capital |
 |----|------|----------|---------|
-| P1 | Crypto Convexity | Long-dated deep ITM LEAPS on IBIT/ETHA | $125,000 |
-| P2 | Hedged Index Income | SPX/ES BWBs with structural hedge | $125,000 |
-| P3 | Macro Stability | Calendars/diagonals on macro ETFs | $125,000 |
-| P4 | Hedged Equity Income | Short puts, strangles, Jade Lizards | $125,000 |
+| P1 | Crypto Convexity | Long-dated deep ITM LEAPS on IBIT/ETHA | $XXX |
+| P2 | Hedged Index Income | SPX/ES BWBs with structural hedge | $XYZ |
+| P3 | Macro Stability | Calendars/diagonals on macro ETFs | $QWS |
+| P4 | Hedged Equity Income | Short puts, strangles, Jade Lizards | $SQZ |
 
 ## Quick Start
 
