@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class TastytradeStreamer:
         # Live data store — updated continuously as events arrive
         self.live_data: dict[str, dict] = {}
         for sym in symbols:
-            self.live_data[sym] = {"quote": None, "greeks": None}
+            self.live_data[sym] = {"quote": None, "greeks": None, "updated_at": None}
 
     async def __aenter__(self):
         from tastytrade.streamer import DXLinkStreamer
@@ -76,6 +77,7 @@ class TastytradeStreamer:
                     "bid_size": float(event.bid_size) if event.bid_size else None,
                     "ask_size": float(event.ask_size) if event.ask_size else None,
                 }
+                self.live_data[sym]["updated_at"] = time.time()
 
     async def _listen_greeks(self) -> None:
         """Listen for Greeks events and update live_data."""
@@ -93,6 +95,7 @@ class TastytradeStreamer:
                     "volatility": float(event.volatility) if event.volatility else None,
                     "price": float(event.price) if event.price else None,
                 }
+                self.live_data[sym]["updated_at"] = time.time()
 
     async def run_for(self, seconds: float = 5.0) -> None:
         """
@@ -141,6 +144,11 @@ class TastytradeStreamer:
         """Return latest quote for a symbol, or None if not yet received."""
         entry = self.live_data.get(symbol)
         return entry["quote"] if entry else None
+
+    def get_timestamp(self, symbol: str) -> Optional[float]:
+        """Return epoch timestamp of last update for a symbol, or None."""
+        entry = self.live_data.get(symbol)
+        return entry["updated_at"] if entry else None
 
     def get_all_greeks(self) -> dict[str, Optional[dict]]:
         """Return greeks for all subscribed symbols."""
