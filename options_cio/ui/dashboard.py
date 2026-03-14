@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -29,8 +30,12 @@ from options_cio.journal.trade_journal import TradeJournal
 from options_cio.simulator.what_if import WhatIfSimulator, SCENARIOS
 from options_cio.ui.widgets import AlertsPanel, AIReviewPanel, PortfolioStatusBar
 
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent.parent
+
+_ZERO_SUMMARY = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0,
+                 "position_count": 0, "pending_count": 0, "stale_count": 0}
 
 
 class OptionsCIODashboard(App):
@@ -91,6 +96,7 @@ class OptionsCIODashboard(App):
     def __init__(self, settings: dict, api_key: Optional[str] = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.settings = settings
+        self._data_source = settings.get("data_source", "yfinance")
         config_dir = BASE_DIR / "config"
 
         with open(config_dir / "portfolios.json") as f:
@@ -104,8 +110,7 @@ class OptionsCIODashboard(App):
         positions_path = BASE_DIR / "active_positions.csv"
         self.pm = PortfolioManager(positions_path, settings.get("db_path", "./options_cio.db")).load()
         self.rules = RulesEngine(config_dir / "trading_rules.json")
-        self.greeks_engine = GreeksEngine()
-        self.feed = YFinanceFeed()
+        self.feed = YFinanceFeed()  # always used for market snapshot
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
             ai_offline=settings.get("ai_offline", False),
@@ -116,9 +121,21 @@ class OptionsCIODashboard(App):
         self.simulator = WhatIfSimulator()
         self.cache = StateCache(settings.get("db_path", "./options_cio.db"))
 
+        # Live data adapter + streamer (tastytrade mode only)
+        self._adapter = None
+        self._streamer = None
+        self._greeks_engine: Optional[GreeksEngine] = None
+
+        if self._data_source == "tastytrade":
+            try:
+                from options_cio.data.tastytrade_adapter import TastytradeAdapter
+                self._adapter = TastytradeAdapter()
+            except Exception as e:
+                logger.error("Could not create TastytradeAdapter: %s", e)
+                self.notify(f"Tastytrade init failed: {e}", severity="error")
+
         # State
         self._price_map: dict[str, float] = {}
-        self._iv_map: dict[str, float] = {}
         self._greeks_summaries: list[dict] = []
         self._portfolio_states: list[dict] = []
         self._alerts: list[str] = []
@@ -165,7 +182,11 @@ class OptionsCIODashboard(App):
 
     def on_mount(self) -> None:
         self._setup_tables()
-        self.run_worker(self._refresh_data(), exclusive=True, name="initial_refresh")
+        if self._adapter is not None:
+            # Start the persistent streamer before the first refresh
+            self.run_worker(self._start_streamer(), exclusive=False, name="streamer")
+        else:
+            self.run_worker(self._refresh_data(), exclusive=True, name="initial_refresh")
         interval = self.settings.get("refresh_interval_seconds", 60)
         self._refresh_timer = self.set_interval(interval, self._auto_refresh)
 
@@ -175,7 +196,7 @@ class OptionsCIODashboard(App):
 
     def _setup_tables(self) -> None:
         greeks_table = self.query_one("#greeks-table", DataTable)
-        greeks_table.add_columns("Portfolio", "Delta", "Gamma", "Theta", "Vega", "Positions")
+        greeks_table.add_columns("Portfolio", "Delta", "Gamma", "Theta", "Vega", "Positions", "Pending")
 
         pos_table = self.query_one("#positions-table", DataTable)
         pos_table.add_columns(
@@ -187,6 +208,63 @@ class OptionsCIODashboard(App):
         journal_table.add_columns("Time", "Portfolio", "Rule", "Severity", "Message")
 
     # ------------------------------------------------------------------
+    # Streamer lifecycle
+    # ------------------------------------------------------------------
+
+    async def _start_streamer(self) -> None:
+        """
+        Collect all option symbols, open the DXLink streamer, and keep it
+        running in the background. Triggers the initial data refresh once
+        the streamer is subscribed.
+        """
+        from options_cio.data.streamer import TastytradeStreamer
+
+        try:
+            symbols = await asyncio.get_event_loop().run_in_executor(
+                None, self._collect_option_symbols
+            )
+
+            if not symbols:
+                self.notify("No option positions — Greeks unavailable", severity="warning")
+                await self._refresh_data()
+                return
+
+            self.notify(f"Streaming Greeks for {len(symbols)} symbols...", severity="information")
+
+            async with TastytradeStreamer(self._adapter.session, symbols) as streamer:
+                self._streamer = streamer
+                self._greeks_engine = GreeksEngine(self._adapter, streamer)
+
+                # Subscribe then do initial refresh after a short warm-up
+                await streamer.subscribe()
+                await asyncio.sleep(2)
+                await self._refresh_data()
+
+                # Keep listening indefinitely (cancelled when app exits)
+                await streamer.run_continuous()
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.notify(f"Streamer error: {e}", severity="error")
+            logger.error("Streamer error: %s", e, exc_info=True)
+            # Fall back to a refresh without live Greeks
+            await self._refresh_data()
+
+    def _collect_option_symbols(self) -> list[str]:
+        """Fetch all option symbols across accounts (sync, for executor)."""
+        symbols: list[str] = []
+        accounts = self._adapter.get_accounts()
+        for pid in accounts:
+            positions = self._adapter.get_positions(pid)
+            for pos in positions:
+                if pos.get("instrument_type") in ("Equity Option", "Future Option"):
+                    sym = pos["symbol"]
+                    if sym not in symbols:
+                        symbols.append(sym)
+        return symbols
+
+    # ------------------------------------------------------------------
     # Data refresh
     # ------------------------------------------------------------------
 
@@ -194,34 +272,32 @@ class OptionsCIODashboard(App):
         self.notify("Refreshing market data...", severity="information")
         try:
             all_positions = self.pm.get_all_positions()
-            tickers = list(set(p["ticker"] for p in all_positions))
 
-            self._price_map = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.feed.get_prices(tickers)
-            )
-            self._iv_map = {}
-            for t in tickers:
-                try:
-                    self._iv_map[t] = self.feed.get_iv_rank(t) / 100.0
-                except ValueError:
-                    self._iv_map[t] = 0.30
             self._market_snapshot = await asyncio.get_event_loop().run_in_executor(
                 None, self.feed.get_market_snapshot
             )
             vix = float(self._market_snapshot.get("vix") or 20.0)
 
             self._portfolio_states = self.pm.get_all_portfolio_states(
-                self._price_map, self.capital_map, vix
+                {}, self.capital_map, vix
             )
             self._greeks_summaries = []
             self._alerts = []
 
             for pid in self.pm.get_portfolio_ids():
                 positions = self.pm.get_positions_for_portfolio(pid)
-                pg = self.greeks_engine.compute_portfolio_greeks(
-                    pid, positions, self._price_map, self._iv_map
-                )
-                summary = pg.summary()
+
+                if self._greeks_engine is not None:
+                    try:
+                        summary = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda p=pid: self._greeks_engine.summary(p)
+                        )
+                    except Exception as e:
+                        logger.warning("Greeks failed for %s: %s", pid, e)
+                        summary = {**_ZERO_SUMMARY, "portfolio": pid}
+                else:
+                    summary = {**_ZERO_SUMMARY, "portfolio": pid}
+
                 self._greeks_summaries.append(summary)
 
                 alerts = self.rules.evaluate_portfolio(
@@ -274,6 +350,7 @@ class OptionsCIODashboard(App):
         greeks_table = self.query_one("#greeks-table", DataTable)
         greeks_table.clear()
         for g in self._greeks_summaries:
+            pending = g.get("pending_count", 0)
             greeks_table.add_row(
                 g.get("portfolio", ""),
                 f"{g.get('delta', 0):+.1f}",
@@ -281,6 +358,7 @@ class OptionsCIODashboard(App):
                 f"{g.get('theta', 0):+.1f}",
                 f"{g.get('vega', 0):+.1f}",
                 str(g.get("position_count", 0)),
+                str(pending) if pending else "-",
             )
 
         # Alerts
@@ -366,7 +444,7 @@ class OptionsCIODashboard(App):
             self.notify(f"AI review error: {e}", severity="error")
 
     async def _run_scenario_analysis(self) -> None:
-        scenario_key = "crash_20"  # default; could be made interactive
+        scenario_key = "crash_20"
         self.notify(f"Running scenario: {scenario_key}...", severity="information")
         try:
             greeks_map = {g["portfolio"]: g for g in self._greeks_summaries}

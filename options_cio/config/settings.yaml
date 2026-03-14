@@ -2,6 +2,6 @@ ai_offline: false
 api_model: claude-sonnet-4-20250514
 refresh_interval_seconds: 60
 ai_call_interval_seconds: 300
-data_source: yfinance  # or "ibkr"
+data_source: tastytrade  # or "yfinance" or "ibkr"
 db_path: ./options_cio.db
 max_api_cost_per_day: 5.00
