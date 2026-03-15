@@ -12,3 +12,5 @@ build/
 venv/
 .DS_Store
 options_cio/config/accounts.yaml
+*.log
+*.log.*

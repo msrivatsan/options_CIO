@@ -1,12 +1,16 @@
 """
 CIO Daily Review — orchestrates the full morning review pipeline:
-  1. Load positions
-  2. Fetch market data
-  3. Compute Greeks (live from tastytrade DXLink, or zeroed in offline/yfinance mode)
-  4. Run rules engine
-  5. Call AI brain
+  1. Connect to tastytrade (or fall back to CSV/yfinance)
+  2. Fetch market data — adapter.get_market_metrics() for IV, yfinance for prices
+  3. Compute Greeks via DXLink streamer (live, not estimated)
+  4. Run rules engine against live positions and balances
+  5. Call AI brain with full live context
   6. Log to journal
   7. Return formatted review text
+
+In tastytrade mode, the review runs fully automatically with zero manual
+input — no screenshots, no CSV exports.  All data is pulled live from the
+broker API and DXLink streaming websocket.
 """
 
 from __future__ import annotations
@@ -22,7 +26,6 @@ from options_cio.core.portfolio_manager import PortfolioManager
 from options_cio.core.rules_engine import RulesEngine
 from options_cio.core.state_cache import StateCache
 from options_cio.ai.cio_brain import CIOBrain
-from options_cio.data.feed_adapter import YFinanceFeed
 from options_cio.journal.trade_journal import TradeJournal
 from options_cio.simulator.what_if import WhatIfSimulator
 
@@ -69,8 +72,8 @@ class CIODailyReview:
 
         self._rules_path = rules_path
         self._adapter = None
+        self._greeks_engine: GreeksEngine | None = None
         self.pm = None  # initialized after adapter or in fallback mode
-        self.feed = YFinanceFeed()  # always used for market snapshot (VIX, SPX)
         self.brain = CIOBrain(
             model=settings.get("api_model", "claude-sonnet-4-20250514"),
             ai_offline=settings.get("ai_offline", False),
@@ -86,84 +89,105 @@ class CIODailyReview:
     # ------------------------------------------------------------------
 
     def run(self) -> str:
-        market_snapshot = self.feed.get_market_snapshot()
-        vix = float(market_snapshot.get("vix") or 20.0)
-
-        greeks_summaries: list[dict] = []
-        all_alerts: list[str] = []
-
         if self._data_source == "tastytrade":
-            # Full live evaluation via tastytrade adapter
-            adapter, greeks_engine = self._build_live_greeks_engine()
-            if adapter is not None:
-                self._adapter = adapter
-                self.pm = PortfolioManager(
-                    self.portfolios_config, adapter, self.cache,
-                )
+            return self._run_live()
 
-                # Check account connectivity
-                connectivity = self.pm.check_account_connectivity()
-                if not connectivity["all_connected"]:
-                    logger.warning(
-                        "Account connectivity issues: %s",
-                        connectivity["disconnected"],
-                    )
+        # Non-tastytrade: fall back to CSV + yfinance
+        from options_cio.data.feed_adapter import YFinanceFeed
 
-                rules = RulesEngine(
-                    self._rules_path, self.portfolios_config,
-                    adapter, greeks_engine,
-                )
-                result = rules.evaluate_all()
+        feed = YFinanceFeed()
+        market_snapshot = feed.get_market_snapshot()
+        vix = float(market_snapshot.get("vix") or 20.0)
+        return self._run_csv_fallback(market_snapshot, vix)
 
-                for alert in result.alerts:
-                    all_alerts.append(str(alert))
-                    self.journal.log_alert(
-                        rule_id=alert.rule_id,
-                        severity=alert.severity.value,
-                        message=alert.message,
-                        portfolio=alert.portfolio,
-                        ticker=alert.ticker,
-                        value=alert.value,
-                        threshold=alert.threshold,
-                    )
+    # ------------------------------------------------------------------
+    # Live tastytrade review (zero manual input)
+    # ------------------------------------------------------------------
 
-                # Portfolio states from live PM
-                portfolio_states = self.pm.get_all_portfolio_states(vix=vix)
+    def _run_live(self) -> str:
+        """Full daily review using only live tastytrade data.
 
-                # Collect greeks summaries from live engine
-                if greeks_engine is not None:
-                    for pid in adapter.get_accounts():
-                        try:
-                            greeks_summaries.append(greeks_engine.summary(pid))
-                        except Exception as e:
-                            logger.warning("Greeks summary failed for %s: %s", pid, e)
-                            greeks_summaries.append(_zero_greeks_summary(pid))
+        Data sources:
+          - Market context: adapter.get_market_metrics() for IV data,
+            yfinance for VIX/SPX/BTC/10Y prices (tastytrade doesn't serve these)
+          - Capital & risk: adapter.get_balances() for OBP per account
+          - Greeks: DXLink streamer — always visible when connected
+          - Positions: adapter.get_positions() per account
+          - Rules: RulesEngine consuming live adapter + greeks engine
+        """
+        # 1. Connect to tastytrade and stream Greeks
+        adapter, greeks_engine = self._build_live_greeks_engine()
+        if adapter is None:
+            logger.error("Tastytrade connection failed — falling back to CSV")
+            from options_cio.data.feed_adapter import YFinanceFeed
 
-                # Format positions from live PM
-                positions_lines = []
-                for pid in self.pm.get_portfolio_ids():
-                    for pos in self.pm.get_positions(pid):
-                        positions_lines.append(
-                            f"{pid} | {pos.get('underlying_symbol', '')} "
-                            f"{pos.get('option_type', pos.get('instrument_type', ''))} "
-                            f"{pos.get('strike_price', '')} "
-                            f"exp:{pos.get('expiration_date', '')} "
-                            f"qty:{pos.get('quantity', '')} "
-                            f"@ ${pos.get('average_open_price', '')} "
-                            f"[{pos.get('role', '')}] "
-                            f"DTE:{pos.get('dte', '?')}"
-                        )
-                positions_summary = "\n".join(positions_lines)
-            else:
-                # Tastytrade init failed — fall back to CSV
-                return self._run_csv_fallback(market_snapshot, vix)
-        else:
+            feed = YFinanceFeed()
+            market_snapshot = feed.get_market_snapshot()
+            vix = float(market_snapshot.get("vix") or 20.0)
             return self._run_csv_fallback(market_snapshot, vix)
 
-        if not greeks_summaries:
-            for pid in self.pm.get_portfolio_ids():
-                greeks_summaries.append(_zero_greeks_summary(pid))
+        self._adapter = adapter
+        self._greeks_engine = greeks_engine
+        self.brain._adapter = adapter
+        self.simulator._adapter = adapter
+        streamer = greeks_engine.streamer if greeks_engine else None
+        if streamer is not None:
+            self.brain._streamer = streamer
+            self.simulator._streamer = streamer
 
+        self.pm = PortfolioManager(
+            self.portfolios_config, adapter, self.cache,
+        )
+
+        # 2. Build market snapshot: yfinance prices + tastytrade IV metrics
+        market_snapshot = self._build_market_snapshot(adapter)
+        vix = float(market_snapshot.get("vix") or 20.0)
+
+        # 3. Auto-sync journal from broker transactions
+        try:
+            self.journal.sync_from_broker(adapter)
+            self.journal.detect_position_changes(adapter, streamer)
+        except Exception as e:
+            logger.warning("Journal broker sync failed: %s", e)
+
+        # 4. Check account connectivity
+        connectivity = self.pm.check_account_connectivity()
+        if not connectivity["all_connected"]:
+            logger.warning(
+                "Account connectivity issues: %s",
+                connectivity["disconnected"],
+            )
+
+        # 5. Run rules engine against live data
+        rules = RulesEngine(
+            self._rules_path, self.portfolios_config,
+            adapter, greeks_engine,
+        )
+        result = rules.evaluate_all()
+
+        all_alerts: list[str] = []
+        for alert in result.alerts:
+            all_alerts.append(str(alert))
+            self.journal.log_alert(
+                rule_id=alert.rule_id,
+                severity=alert.severity.value,
+                message=alert.message,
+                portfolio=alert.portfolio,
+                ticker=alert.ticker,
+                value=alert.value,
+                threshold=alert.threshold,
+            )
+
+        # 6. Portfolio states from live PM (balances from adapter.get_balances)
+        portfolio_states = self.pm.get_all_portfolio_states(vix=vix)
+
+        # 7. Collect greeks summaries — streamer always has data when connected
+        greeks_summaries = self._collect_greeks_summaries(adapter, greeks_engine)
+
+        # 8. Format positions from live adapter
+        positions_summary = self._format_live_positions()
+
+        # 9. AI review
         ai_output = self.brain.daily_review(
             portfolio_states=portfolio_states,
             greeks_summaries=greeks_summaries,
@@ -179,7 +203,111 @@ class CIODailyReview:
             cost_usd=self.brain.get_daily_cost(),
         )
 
-        return self._format_output(market_snapshot, greeks_summaries, all_alerts, ai_output)
+        return self._format_output(
+            market_snapshot, greeks_summaries, all_alerts, ai_output,
+            streamer_connected=streamer is not None,
+        )
+
+    # ------------------------------------------------------------------
+    # Market snapshot: yfinance prices + tastytrade IV metrics
+    # ------------------------------------------------------------------
+
+    def _build_market_snapshot(self, adapter) -> dict:
+        """Build market snapshot combining yfinance prices with tastytrade IV.
+
+        VIX, SPX, BTC, and 10Y prices come from yfinance (tastytrade doesn't
+        serve index prices).  IV rank, IV percentile, and other vol metrics
+        come from adapter.get_market_metrics() on the book's underlyings.
+        """
+        from options_cio.data.feed_adapter import YFinanceFeed
+
+        feed = YFinanceFeed()
+        snapshot = feed.get_market_snapshot()
+
+        # Collect unique underlyings across all portfolios
+        underlyings: list[str] = []
+        for pid in self.pm.get_portfolio_ids():
+            for pos in adapter.get_positions(pid):
+                sym = pos.get("underlying_symbol", "")
+                if sym and sym not in underlyings:
+                    underlyings.append(sym)
+
+        # Fetch tastytrade market metrics for all book underlyings
+        if underlyings:
+            try:
+                metrics = adapter.get_market_metrics(underlyings)
+                snapshot["market_metrics"] = metrics
+            except Exception as e:
+                logger.warning("Failed to fetch market metrics: %s", e)
+                snapshot["market_metrics"] = {}
+        else:
+            snapshot["market_metrics"] = {}
+
+        # Add system-level balances for the capital/risk section
+        try:
+            snapshot["system_balances"] = adapter.get_system_balances()
+        except Exception as e:
+            logger.warning("Failed to fetch system balances: %s", e)
+
+        snapshot["data_source"] = "tastytrade"
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Greeks collection with streamer status awareness
+    # ------------------------------------------------------------------
+
+    def _collect_greeks_summaries(
+        self, adapter, greeks_engine: GreeksEngine | None,
+    ) -> list[dict]:
+        """Collect greeks summaries from the live engine.
+
+        When the streamer is connected, vega and gamma are always visible —
+        no YELLOW for missing data unless the streamer is actually down or
+        data is genuinely stale.
+        """
+        summaries: list[dict] = []
+
+        if greeks_engine is not None:
+            for pid in adapter.get_accounts():
+                try:
+                    summary = greeks_engine.summary(pid)
+                    # Tag with streamer status so the formatter can display it
+                    summary["streamer_connected"] = True
+                    summaries.append(summary)
+                except Exception as e:
+                    logger.warning("Greeks summary failed for %s: %s", pid, e)
+                    s = _zero_greeks_summary(pid)
+                    s["streamer_connected"] = False
+                    summaries.append(s)
+        else:
+            # No streamer — zero greeks, flag as disconnected
+            for pid in self.pm.get_portfolio_ids():
+                s = _zero_greeks_summary(pid)
+                s["streamer_connected"] = False
+                summaries.append(s)
+
+        return summaries
+
+    # ------------------------------------------------------------------
+    # Live position formatting
+    # ------------------------------------------------------------------
+
+    def _format_live_positions(self) -> str:
+        """Format positions from live adapter data (no CSV parsing)."""
+        lines = []
+        for pid in self.pm.get_portfolio_ids():
+            for pos in self.pm.get_positions(pid):
+                lines.append(
+                    f"{pid} | {pos.get('underlying_symbol', '')} "
+                    f"{pos.get('option_type', pos.get('instrument_type', ''))} "
+                    f"{pos.get('strike_price', '')} "
+                    f"exp:{pos.get('expiration_date', '')} "
+                    f"qty:{pos.get('quantity', '')} "
+                    f"@ ${pos.get('average_open_price', '')} "
+                    f"[{pos.get('role', '')}] "
+                    f"DTE:{pos.get('dte', '?')}"
+                )
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Live Greeks via tastytrade
@@ -332,26 +460,70 @@ class CIODailyReview:
         greeks_summaries: list[dict],
         alerts: list[str],
         ai_output: str,
+        streamer_connected: bool = False,
     ) -> str:
         separator = "=" * 60
+        source_tag = "LIVE" if market_snapshot.get("data_source") == "tastytrade" else "DELAYED"
         lines = [
             separator,
-            f"  OPTIONS CIO — DAILY REVIEW  {date.today()}",
+            f"  OPTIONS CIO — DAILY REVIEW  {date.today()}  [{source_tag}]",
             separator,
             "",
             f"  SPX: {market_snapshot.get('spx', 'N/A')}  |  VIX: {market_snapshot.get('vix', 'N/A')}",
             f"  BTC: {market_snapshot.get('btc', 'N/A')}  |  10Y: {market_snapshot.get('yield_10y', 'N/A')}",
-            "",
-            "── Greeks Summary ──────────────────────────────────────",
         ]
+
+        # IV metrics from tastytrade (Section 0 enrichment)
+        metrics = market_snapshot.get("market_metrics", {})
+        if metrics:
+            lines.append("")
+            lines.append("── IV Context (tastytrade) ─────────────────────────────")
+            for sym, m in sorted(metrics.items()):
+                iv_rank = m.get("tw_iv_rank")
+                iv_pct = m.get("iv_percentile")
+                iv_30 = m.get("iv_30_day")
+                parts = [f"  {sym:6s}"]
+                if iv_rank is not None:
+                    parts.append(f"IVR={iv_rank:.0f}")
+                if iv_pct is not None:
+                    parts.append(f"IV%={iv_pct:.0f}")
+                if iv_30 is not None:
+                    parts.append(f"IV30={iv_30:.1%}")
+                lines.append("  ".join(parts))
+
+        # System balances (Section 1)
+        sys_bal = market_snapshot.get("system_balances", {})
+        if sys_bal:
+            lines.append("")
+            lines.append("── Capital & Risk (live OBP) ────────────────────────────")
+            lines.append(
+                f"  System Net Liq: ${sys_bal.get('system_net_liquidating_value', 0):,.0f}"
+                f"  |  System OBP: ${sys_bal.get('system_option_buying_power', 0):,.0f}"
+                f"  |  Deployed: {sys_bal.get('system_deployment_pct', 0):.1f}%"
+            )
+            for pid, bal in sorted(sys_bal.get("portfolios", {}).items()):
+                lines.append(
+                    f"    {pid}: Net Liq ${bal.get('net_liquidating_value', 0):,.0f}"
+                    f"  OBP ${bal.get('option_buying_power', 0):,.0f}"
+                    f"  Deploy {bal.get('deployment_pct', 0):.1f}%"
+                )
+
+        lines.append("")
+
+        # Greeks (Section 1.3) — streamer status determines display
+        streamer_label = "LIVE via DXLink" if streamer_connected else "OFFLINE"
+        lines.append(f"── Greeks Summary ({streamer_label}) ─────────────────────")
         for g in greeks_summaries:
+            connected = g.get("streamer_connected", False)
             pending = g.get("pending_count", 0)
             stale = g.get("stale_count", 0)
             flags = ""
-            if pending:
-                flags += f" [{pending} PENDING]"
-            if stale:
-                flags += f" [{stale} STALE]"
+            if not connected:
+                flags = " [STREAMER DOWN]"
+            elif stale:
+                flags = f" [{stale} STALE]"
+            elif pending:
+                flags = f" [{pending} PENDING]"
             lines.append(
                 f"  {g['portfolio']:4s}  Δ={g['delta']:+.1f}  Γ={g['gamma']:+.4f}  "
                 f"Θ={g['theta']:+.1f}  V={g['vega']:+.1f}{flags}"

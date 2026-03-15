@@ -1,57 +1,98 @@
 # Options CIO
 
-A systematic options portfolio management system powered by Claude AI. Manages 4 distinct portfolios with strict mandates, real-time Greeks, rules enforcement, and AI-driven daily reviews.
-
-## Portfolios
-
-| ID | Name | Strategy | Capital |
-|----|------|----------|---------|
-| P1 | Crypto Convexity | Long-dated deep ITM LEAPS on IBIT/ETHA | $XXX |
-| P2 | Hedged Index Income | SPX/ES BWBs with structural hedge | $XYZ |
-| P3 | Macro Stability | Calendars/diagonals on macro ETFs | $QWS |
-| P4 | Hedged Equity Income | Short puts, strangles, Jade Lizards | $SQZ |
+A systematic options portfolio management system powered by Claude AI. Manages 4 distinct portfolios with strict mandates, real-time Greeks via tastytrade DXLink, rules enforcement, and AI-driven daily reviews.
 
 ## Quick Start
 
-### 1. Set Environment Variables
+### 1. Install Dependencies
 ```bash
-# Anthropic Claude API
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Tastytrade OAuth (for live data)
-export TASTYTRADE_CLIENT_SECRET=your-client-secret
-export TASTYTRADE_REFRESH_TOKEN=your-refresh-token
+pip install -r requirements.txt
 ```
 
-### 2. Configure Accounts
-Edit `config/accounts.yaml` — replace placeholders with your actual tastytrade account numbers:
+### 2. Set Up Tastytrade Credentials
+
+Create an OAuth application at [tastytrade.com](https://tastytrade.com) under **My Account > OAuth Applications > Manage > Create Grant**.
+
+```bash
+# Add to .env file (already in .gitignore)
+export TASTYTRADE_CLIENT_SECRET='your-client-secret'
+export TASTYTRADE_REFRESH_TOKEN='your-refresh-token'
+```
+
+### 3. Configure Account Mapping
+
+Edit `config/accounts.yaml` with your tastytrade account numbers:
 ```yaml
 accounts:
-  - account_number: "ACCOUNT_NUM_FOR_P1"
+  - account_number: "YOUR_P1_ACCOUNT"
     portfolio: P1
     name: "Crypto Convexity"
-  # ... repeat for P2, P3, P4
+  - account_number: "YOUR_P2_ACCOUNT"
+    portfolio: P2
+    name: "Hedged Index Income"
+  - account_number: "YOUR_P3_ACCOUNT"
+    portfolio: P3
+    name: "Macro Stability"
+  - account_number: "YOUR_P4_ACCOUNT"
+    portfolio: P4
+    name: "Hedged Equity Income"
 ```
 
-### 3. Test Connection
+Find your account numbers in tastytrade under **My Account > Account Details**.
+
+### 4. Test Connection
 ```bash
 python scripts/test_connection.py
 ```
-This validates authentication, discovers accounts, fetches balances & positions, and streams live Greeks.
+Validates authentication, discovers accounts, fetches balances and positions, and streams live Greeks.
 
-### 4. Launch Dashboard
+### 5. Launch
 ```bash
-# Launch TUI dashboard (live tastytrade data)
+# TUI dashboard (live streaming data)
 python -m options_cio.main
 
-# Run daily review to stdout (no TUI)
+# Daily review to stdout
 python -m options_cio.main --review
 
-# Offline mode (no API calls, no tastytrade)
+# Offline mode (no API calls)
 python -m options_cio.main --offline
+
+# Skip startup validation
+python -m options_cio.main --skip-checks
 ```
 
-## Structure
+## Portfolios
+
+| ID | Name | Strategy | Deployment Band |
+|----|------|----------|-----------------|
+| P1 | Crypto Convexity | Long-dated deep ITM LEAPS (IBIT/ETHA) | 30-50% |
+| P2 | Hedged Index Income | SPX/ES BWBs + structural hedge | 50-65% |
+| P3 | Macro Stability | Calendars/diagonals on macro ETFs | 0-20% |
+| P4 | Hedged Equity Income | Short puts, strangles, Jade Lizards | 55-70% |
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `R` | Refresh positions, balances, and rules |
+| `A` | Run AI CIO review |
+| `S` | Run crash scenario (SPX -20%) |
+| `C` | Toggle connection diagnostics (API latency, streamer status, per-symbol freshness) |
+| `L` | Toggle log panel (last 50 lines from options_cio.log) |
+| `1` | Overview tab |
+| `2` | Positions tab |
+| `3` | Journal/alerts tab |
+| `Q` | Quit (graceful shutdown with session summary) |
+
+## Architecture
+
+```
+tastytrade REST API ──> TastytradeAdapter ──> PortfolioManager ──> RulesEngine ──> Dashboard
+                    \                     \                                    /
+                     ──> DXLinkStreamer ──> GreeksEngine ─────────────────────/
+                                                                             \
+                                                                     CIOBrain (Claude AI)
+```
 
 ```
 options_cio/
@@ -59,78 +100,134 @@ options_cio/
 ├── core/                # Greeks engine, rules engine, portfolio manager, state cache
 ├── ai/                  # CIO Brain (Claude) + prompt templates
 ├── ui/                  # Textual TUI dashboard + widgets
-├── data/                # Live data adapters (tastytrade primary, yfinance fallback, IBKR stub)
-│   ├── tastytrade_adapter.py   # OAuth-backed live positions, balances, Greeks
-│   ├── streamer.py             # Real-time DXLink Quote & Greeks via websocket
-│   └── feed_adapter.py          # Abstract interface + yfinance fallback
-├── journal/             # SQLite trade + alert journal
+├── data/                # Live data adapters (tastytrade primary, yfinance fallback)
+│   ├── tastytrade_adapter.py   # OAuth REST — positions, balances, metrics, transactions
+│   ├── streamer.py             # DXLink websocket — real-time quotes & Greeks
+│   └── feed_adapter.py         # Abstract interface + yfinance fallback
+├── journal/             # SQLite trade + alert journal with auto-sync
 ├── simulator/           # What-if scenario analysis
 ├── daily_review/        # Orchestrated daily review pipeline
+├── logging_config.py    # Centralized logging (rotating file + console)
 ├── scripts/
-│   └── test_connection.py       # Validate tastytrade auth & live streaming
-├── active_positions.csv # Legacy CSV (kept for offline reference)
-└── main.py              # Entry point
+│   └── test_connection.py
+└── main.py              # Entry point with startup validation
 ```
 
-## Dashboard Keybindings
+## Data Flow
 
-| Key | Action |
-|-----|--------|
-| `R` | Refresh market data & Greeks |
-| `A` | Run AI CIO review |
-| `S` | Run crash scenario (SPX -20%) |
-| `1` | Overview tab |
-| `2` | Positions tab |
-| `3` | Journal/alerts tab |
-| `Q` | Quit |
+```
+REST API (every 60s)           WebSocket (continuous)       AI (event-driven)
+├── Positions                  ├── Quotes (bid/ask)         ├── On violation
+├── Balances (OBP)             └── Greeks (delta/gamma/     ├── On user query
+├── Market metrics (IV)            theta/vega per contract)  └── On 5-min summary
+└── Transactions
+```
 
-## Configuration
+- **Greeks and quotes**: CONTINUOUS via DXLink websocket, UI updates every 2 seconds
+- **Positions and balances**: REST polling every 60 seconds
+- **Rules evaluation**: Runs on every position/balance refresh
+- **AI calls**: Event-driven (new violation, user query, or periodic summary)
 
-- `config/settings.yaml` — API model, refresh intervals, cost limits, data source (default: `tastytrade`)
-- `config/portfolios.json` — Full portfolio mandates, deployment bands, prohibitions
-- `config/trading_rules.json` — Quantitative rules (DTE, profit targets, stop losses)
-- `config/accounts.yaml` — Tastytrade account ↔ portfolio mapping (required for live data)
-- `active_positions.csv` — Legacy CSV (kept for offline/fallback reference)
+## Configuration Reference
 
-## AI Cost Management
+### `config/settings.yaml`
+```yaml
+ai_offline: false              # true to disable all Claude API calls
+api_model: claude-sonnet-4-20250514  # Claude model for AI reviews
+refresh_interval_seconds: 60   # REST polling interval
+ai_call_interval_seconds: 300  # Auto AI review interval
+data_source: tastytrade        # tastytrade | yfinance | ibkr
+db_path: ./options_cio.db      # SQLite database path
+max_api_cost_per_day: 5.00     # Daily Claude API budget
+```
 
-The CIO Brain tracks daily API spend against `max_api_cost_per_day` (default $5.00).
-Once the limit is reached, AI calls are skipped and a rule-based summary is shown instead.
-Set `ai_offline: true` in settings.yaml to disable all AI calls.
+### `config/accounts.yaml`
+Maps tastytrade account numbers to portfolio IDs. Find account numbers in tastytrade under My Account > Account Details.
 
-## Live Data Integration
+### `config/portfolios.json`
+Full portfolio mandates: deployment bands, target zones, allowed instruments, hedge requirements, prohibitions. Each portfolio has a `mandate` field describing its governance rules.
 
-### Tastytrade (Primary)
-The system uses **tastytrade** as the primary data source for real-time positions, balances, option chains, and Greeks.
+### `config/trading_rules.json`
+Quantitative rules: max risk per trade, delta limits, profit targets, stop losses, DTE thresholds. System rules: no income without hedge, no hedge removal, no deployment increase during vol spikes.
 
-**Setup:**
-1. Create an OAuth app in your tastytrade account
-2. Obtain `TASTYTRADE_CLIENT_SECRET` and `TASTYTRADE_REFRESH_TOKEN`
-3. Set these as environment variables
-4. Configure `config/accounts.yaml` with your account numbers
-5. Run `python scripts/test_connection.py` to validate
+All config files support hot-reload (except `accounts.yaml`, which requires restart). Changes are detected every 30 seconds and applied immediately.
 
-**What you get:**
-- Real-time position data (live OBP = option buying power = deployment metric)
-- Streaming Quote & Greeks via DXLink websocket
-- Option chains, market metrics (IV rank, IV percentile, historical volatility)
-- Transaction history for journal auto-population
+## Error Handling
 
-### Fallback & Offline
-- **YFinance fallback:** If tastytrade connection fails, the system automatically falls back to yfinance for prices and historical volatility
-- **Offline mode:** Run with `--offline` flag to use cached data only (no API calls)
+### Tastytrade API
+- **Rate limiting**: Token-bucket limiter (~2 req/s) prevents 429 errors
+- **Retries**: 3 attempts with exponential backoff for transient errors (5xx, timeouts)
+- **401 Unauthorized**: Auto-refreshes session up to 3 times, then prints re-auth instructions
+- **403 Forbidden**: Never retried (scope issue), logged clearly
+- **Timeouts**: 10s on all REST calls, falls back to cached data if available
 
-### Switching Data Sources
-Change `data_source:` in `config/settings.yaml`:
-- `tastytrade` — primary (requires OAuth env vars + accounts.yaml)
-- `yfinance` — public, no auth required, ~15s price cache
-- `ibkr` — IBKR API stub (not yet implemented)
+### DXLink Streamer
+- **Disconnect**: Logged, all Greeks flagged STALE, auto-reconnect every 10 seconds
+- **Reconnect**: Resubscribes to all position symbols automatically
+- **Down > 60s**: Dashboard shows DELAYED indicator, REST polling continues
+
+### Claude API
+- **Failure**: Logged, "AI OFFLINE" shown in panel, dashboard continues without AI
+- **Budget exceeded**: All AI calls stopped, budget status shown in panel
+
+### SQLite
+- **Corrupt**: Detected via PRAGMA integrity_check on startup, renamed and fresh DB created
+- **Locked**: Falls back to in-memory dict for the session with warning
+
+### General TUI Rule
+The dashboard never crashes. All exceptions in the main event loop are caught, logged, and displayed in the error status bar.
+
+## Read-Only Safety
+
+- OAuth scope is read-only
+- The adapter module header explicitly prohibits order imports
+- No execution capability exists in the codebase
+- The system can only observe, analyze, and recommend — never trade
+
+## Cost Breakdown
+
+| Service | Cost |
+|---------|------|
+| tastytrade API | Free |
+| DXLink streaming | Free |
+| Claude API | ~$2-8/month depending on query frequency |
+| **Total** | **$2-8/month** |
+
+The CIO Brain tracks daily spend against `max_api_cost_per_day` (default $5.00). Set `ai_offline: true` to eliminate all API costs.
+
+## Logging
+
+Two log handlers:
+- **File**: `options_cio.log` — rotating (10MB max, 5 backups), DEBUG level
+- **Console**: stderr, INFO level
+
+Log levels:
+- **DEBUG**: All API calls (endpoint, response time, status), streamer events
+- **INFO**: State changes, position changes, rules results, AI calls
+- **WARNING**: Stale data, streamer reconnection, rate limits, fallback mode
+- **ERROR**: API failures, auth issues, config parse errors
+- **CRITICAL**: Rule breaches (CRITICAL severity), system RED, hedge insufficient
+
+Press `L` in the dashboard to view the log panel.
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| "Authentication failed" | Regenerate refresh token at tastytrade.com > OAuth Applications |
+| "Account not found" | Check account number in `config/accounts.yaml` |
+| "Streamer timeout" | Check internet; tastytrade may be in maintenance (try during market hours) |
+| "STALE DATA warnings" | Streamer disconnected — will auto-reconnect in 10 seconds |
+| "AI OFFLINE" | Check `ANTHROPIC_API_KEY` env var; check daily budget not exhausted |
+| "Rules not updating" | Verify `trading_rules.json` is valid JSON (use a JSON linter) |
+| "Database corrupt" | Auto-detected on startup; corrupt file renamed, fresh DB created |
+| "Missing env var" | Set `TASTYTRADE_CLIENT_SECRET` and `TASTYTRADE_REFRESH_TOKEN` in `.env` |
 
 ## Security
 
-**API Keys & Credentials:**
-- `ANTHROPIC_API_KEY` — your Claude API key
-- `TASTYTRADE_CLIENT_SECRET`, `TASTYTRADE_REFRESH_TOKEN` — OAuth secrets
-- **Never commit these to Git.** Use environment variables or a `.env` file (already in `.gitignore`)
+**Never commit credentials to Git.** All sensitive values use environment variables or `.env` (already in `.gitignore`):
+- `ANTHROPIC_API_KEY` — Claude API key
+- `TASTYTRADE_CLIENT_SECRET` — OAuth client secret
+- `TASTYTRADE_REFRESH_TOKEN` — OAuth refresh token
 
 If credentials are accidentally exposed, revoke them immediately and rotate.

@@ -101,6 +101,7 @@ class StateCache:
     def __init__(self, db_path: str = "options_cio.db") -> None:
         self.db_path = db_path if db_path == ":memory:" else str(Path(db_path).resolve())
         self._local = threading.local()
+        self._fallback_memory = False
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -108,21 +109,39 @@ class StateCache:
     # ------------------------------------------------------------------
 
     def _get_conn(self) -> sqlite3.Connection:
-        """Return a thread-local connection, creating one if needed."""
+        """Return a thread-local connection, creating one if needed.
+
+        Falls back to in-memory SQLite if the file database is locked or corrupt.
+        """
         conn: Optional[sqlite3.Connection] = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.row_factory = sqlite3.Row
+            target = ":memory:" if self._fallback_memory else self.db_path
+            try:
+                conn = sqlite3.connect(target, timeout=5)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.row_factory = sqlite3.Row
+            except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                self._fallback_memory = True
+                conn = sqlite3.connect(":memory:")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn
 
     def _init_db(self) -> None:
-        conn = self._get_conn()
-        for stmt in self._SCHEMA:
-            conn.execute(stmt)
-        conn.commit()
+        try:
+            conn = self._get_conn()
+            for stmt in self._SCHEMA:
+                conn.execute(stmt)
+            conn.commit()
+        except (sqlite3.DatabaseError, sqlite3.OperationalError):
+            self._fallback_memory = True
+            self._local.conn = None  # reset so _get_conn creates in-memory
+            conn = self._get_conn()
+            for stmt in self._SCHEMA:
+                conn.execute(stmt)
+            conn.commit()
 
     # ------------------------------------------------------------------
     # Positions
