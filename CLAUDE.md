@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**options-cio** is a systematic options portfolio management system for a $500K book split across 4 mandate-driven portfolios. It provides real-time Greeks, rules enforcement, AI-driven daily reviews (Claude), what-if scenario analysis, and a Textual TUI dashboard.
+**options-cio** is a systematic options portfolio management system for a $XYZ book split across 4 mandate-driven portfolios. It provides real-time Greeks, rules enforcement, AI-driven daily reviews (Claude), what-if scenario analysis, and a Textual TUI dashboard.
 
 **Location:** `C:\Users\madha\options-cio\`
 **Python:** 3.13 | **Entry point:** `python -m options_cio.main`
@@ -55,10 +55,10 @@ options_cio/
 
 | ID | Name | Strategy | Capital | Deployment Band |
 |----|------|----------|---------|-----------------|
-| P1 | Crypto Convexity | Long-dated deep ITM LEAPS (IBIT/ETHA) | $125,000 | 30–50% |
-| P2 | Hedged Index Income | SPX/ES BWBs + structural hedge | $125,000 | 50–65% |
-| P3 | Macro Stability | Calendars/diagonals on macro ETFs | $125,000 | 0–20% |
-| P4 | Hedged Equity Income | Short puts, strangles, Jade Lizards | $125,000 | 55–70% |
+| P1 | Crypto Convexity | Long-dated deep ITM LEAPS (IBIT/ETHA) | $uhm | 30–50% |
+| P2 | Hedged Index Income | SPX/ES BWBs + structural hedge | $uhm | 50–65% |
+| P3 | Macro Stability | Calendars/diagonals on macro ETFs | $uhm | 0–20% |
+| P4 | Hedged Equity Income | Short puts, strangles, Jade Lizards | $uhm | 55–70% |
 
 **Absolute System Rules (never advise or implement code that breaches these):**
 1. No income strategy without a structural hedge.
