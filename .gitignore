@@ -14,3 +14,4 @@ venv/
 options_cio/config/accounts.yaml
 *.log
 *.log.*
+CLAUDE.md
